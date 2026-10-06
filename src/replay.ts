@@ -81,6 +81,11 @@ export function replayFromEvents(
   }
   closeBatch();
 
+  // Zero-event commits (rejected baskets, not_found cancels, ...) consume a
+  // recvSeq without leaving event rows. The commits table is the high-water
+  // truth for BOTH sequences; without this the next submit would reuse an
+  // already-committed recvSeq and collide on the commits primary key.
+  engine.setRecvSeqHighWater(maxCommitSeq);
   engine.setCommittedSeq(maxCommitSeq);
   return { engine, lastEventSeq, lastCommitSeq: maxCommitSeq };
 }

@@ -13,7 +13,7 @@
 // never re-runs matching: the replayer (`replay.ts`) reconstructs state by
 // consuming already-persisted trade facts, so trades cannot be regenerated.
 
-import { basketReceipt, labelLegEvents } from "./basket.js";
+import { committedBasketReceipt, rejectedBasketReceipt } from "./basket.js";
 import type {
   TradeRequest,
   BasketOrderRequest,
@@ -38,6 +38,17 @@ import type {
 interface PriceLevel {
   // FIFO queue ordered by ascending priority recvSeq.
   orders: RestingOrder[];
+}
+
+/**
+ * Consistent copy of the mutable book structures. Every resting order is
+ * cloned exactly once, so the identity sharing between the price-level
+ * queues and the id index is preserved inside the copy.
+ */
+interface BookState {
+  bids: Map<number, PriceLevel>;
+  asks: Map<number, PriceLevel>;
+  orders: Map<string, RestingOrder>;
 }
 
 let monotonicOrderId = 0;
@@ -67,6 +78,12 @@ export class MatchingEngine {
   private orders = new Map<string, RestingOrder>();
   private lastRecvSeq = 0;
   private committedSeq = 0;
+  /**
+   * Trade ordinal within the request currently being processed. Reset once
+   * per recvSeq in `process`, so every trade id `t-<recvSeq>-<n>` is unique
+   * within a commit (including all legs of a basket) and across commits.
+   */
+  private tradesThisSeq = 0;
 
   get lastCommitSeq(): number {
     return this.committedSeq;
@@ -154,6 +171,7 @@ export class MatchingEngine {
       );
     }
     this.lastRecvSeq = recvSeq;
+    this.tradesThisSeq = 0;
 
     switch (req.kind) {
       case "basket":
@@ -167,17 +185,67 @@ export class MatchingEngine {
     }
   }
 
+  /**
+   * All-or-nothing immediate basket. Legs are evaluated in declared order,
+   * each against the residual book left by the preceding legs. If every leg
+   * fully fills within its own limit, the whole basket is one outcome at
+   * this recvSeq. Otherwise the book is restored to its pre-basket state
+   * and the outcome carries NO events: the rejection still consumes the
+   * recvSeq and is durably committed by the caller (commit row + receipt),
+   * but no trade/order event exists and nothing is published.
+   */
   private basket(req: BasketOrderRequest, recvSeq: number): ProcessOutcome {
+    const saved = this.saveBookState();
     const events: MatchEvent[] = [];
     const legs: PlaceReceipt[] = [];
+    let failedLeg = -1;
+
     for (let i = 0; i < req.legs.length; i++) {
-      const outcome = this.place(req.legs[i]!, recvSeq);
+      const legReq = req.legs[i]!;
+      if (failedLeg >= 0) {
+        // Basket already failed: this leg is never attempted.
+        legs.push(this.unattemptedLegReceipt(legReq, recvSeq));
+        continue;
+      }
+      const outcome = this.place(legReq, recvSeq);
       const receipt = outcome.receipt as PlaceReceipt;
-      labelLegEvents(outcome.events, receipt, recvSeq, i);
-      events.push(...outcome.events);
       legs.push(receipt);
+      if (receipt.status === "fully_filled") {
+        events.push(...outcome.events);
+      } else {
+        failedLeg = i;
+      }
     }
-    return { events, receipt: basketReceipt(legs) };
+
+    if (failedLeg >= 0) {
+      // Roll back every tentative effect of the earlier legs: the makers
+      // they consumed are restored exactly, and no event escapes.
+      this.restoreBookState(saved);
+      return { events: [], receipt: rejectedBasketReceipt(legs, failedLeg) };
+    }
+    return { events, receipt: committedBasketReceipt(legs) };
+  }
+
+  /** Receipt for a leg that was never matched because an earlier leg failed. */
+  private unattemptedLegReceipt(
+    req: PlaceOrderRequest,
+    recvSeq: number,
+  ): PlaceReceipt {
+    return {
+      kind: "place",
+      orderId: newOrderId(recvSeq),
+      ...(req.clientOrderId !== undefined
+        ? { clientOrderId: req.clientOrderId }
+        : {}),
+      status: "rejected",
+      side: req.side,
+      price: req.price,
+      submitQty: req.qty,
+      filledQty: 0,
+      remainingQty: req.qty,
+      fills: [],
+      rejectReason: "basket rejected before this leg was attempted",
+    };
   }
 
   private place(req: PlaceOrderRequest, recvSeq: number): ProcessOutcome {
@@ -241,7 +309,9 @@ export class MatchingEngine {
   /**
    * Match an aggressor against the opposite book. Mutates resting orders
    * and appends trade events. Limit prices are enforced; trades execute at
-   * the resting order's price (maker price).
+   * the resting order's price (maker price). Trade ids draw from the
+   * per-recvSeq counter, so consecutive aggressors of one request (basket
+   * legs) never repeat an id.
    */
   private matchAggressor(
     aggressor: RestingOrder,
@@ -250,7 +320,6 @@ export class MatchingEngine {
   ): { fills: PlaceReceipt["fills"] } {
     const fills: PlaceReceipt["fills"] = [];
     const opposite = aggressor.side === "buy" ? this.asks : this.bids;
-    let tradeCounter = 0;
 
     while (aggressor.filledQty < aggressor.totalQty) {
       const best = this.bestPrice(opposite, aggressor.side);
@@ -271,8 +340,8 @@ export class MatchingEngine {
 
         resting.filledQty += qty;
         aggressor.filledQty += qty;
-        tradeCounter += 1;
-        const tid = tradeId(recvSeq, tradeCounter);
+        this.tradesThisSeq += 1;
+        const tid = tradeId(recvSeq, this.tradesThisSeq);
 
         events.push({
           type: "trade",
@@ -416,6 +485,43 @@ export class MatchingEngine {
 
   // ---- Book structure --------------------------------------------------
 
+  /**
+   * Deep-copy the mutable book state so a tentative multi-leg execution can
+   * be rolled back. Each resting order is cloned exactly once: the copy
+   * keeps the same identity sharing between level queues and the id index
+   * as the live structures.
+   */
+  private saveBookState(): BookState {
+    const clones = new Map<string, RestingOrder>();
+    const clone = (o: RestingOrder): RestingOrder => {
+      let c = clones.get(o.id);
+      if (c === undefined) {
+        c = { ...o };
+        clones.set(o.id, c);
+      }
+      return c;
+    };
+    const copySide = (
+      src: Map<number, PriceLevel>,
+    ): Map<number, PriceLevel> => {
+      const dst = new Map<number, PriceLevel>();
+      for (const [price, level] of src) {
+        dst.set(price, { orders: level.orders.map(clone) });
+      }
+      return dst;
+    };
+    const orders = new Map<string, RestingOrder>();
+    for (const [id, o] of this.orders) orders.set(id, clone(o));
+    return { bids: copySide(this.bids), asks: copySide(this.asks), orders };
+  }
+
+  /** Restore a state produced by saveBookState, discarding tentative edits. */
+  private restoreBookState(state: BookState): void {
+    this.bids = state.bids;
+    this.asks = state.asks;
+    this.orders = state.orders;
+  }
+
   private bookFor(side: Side): Map<number, PriceLevel> {
     return side === "buy" ? this.bids : this.asks;
   }
@@ -469,6 +575,18 @@ export class MatchingEngine {
   /** Restore-side commit bookkeeping; see replay.ts. */
   setCommittedSeq(seq: number): void {
     this.committedSeq = seq;
+  }
+
+  /**
+   * Restore-side receive high-water; see replay.ts. Commits that produce no
+   * events (a rejected all-or-nothing basket, a not_found cancel, ...) leave
+   * no event rows, so replaying events alone cannot reveal their recvSeq.
+   * The ledger's commit high-water is the truth: the next receive sequence
+   * must continue after it, otherwise a reused recvSeq would collide with
+   * the commits primary key and wedge every future submit.
+   */
+  setRecvSeqHighWater(seq: number): void {
+    this.lastRecvSeq = Math.max(this.lastRecvSeq, seq);
   }
 
   snapshot(snapshotSeq: number): BookSnapshotData {

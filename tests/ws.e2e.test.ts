@@ -219,3 +219,167 @@ test("e2e: place orders, observe trades in order, duplicate key replay", async (
   fresh.terminate();
   resub.terminate();
 });
+
+test("e2e: basket over the wire — atomic commit, unique ids, receipt/stream match", async () => {
+  const dir = tempDir();
+  let server: RunningServer = await startWsServer({
+    dbPath: join(dir, "b.db"),
+  });
+  after(async () => {
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const sub = await connect(server.port);
+  send(sub, { type: "subscribe" });
+  const hello = await nextMessage(sub);
+  assert.equal(hello.type, "hello");
+  const subQ = messageQueue(sub);
+
+  const client = await connect(server.port);
+
+  // Resting sellers: 4@100, 4@101.
+  send(client, {
+    type: "submit",
+    request: { kind: "place", side: "sell", price: 100, qty: 4, tif: "GTC" },
+  });
+  assert.equal((await nextMessage(client)).type, "receipt");
+  send(client, {
+    type: "submit",
+    request: { kind: "place", side: "sell", price: 101, qty: 4, tif: "GTC" },
+  });
+  assert.equal((await nextMessage(client)).type, "receipt");
+
+  // Successful 2-leg basket at one recvSeq.
+  send(client, {
+    type: "submit",
+    key: "bk-1",
+    request: {
+      kind: "basket",
+      legs: [
+        { kind: "place", side: "buy", price: 100, qty: 2, tif: "IOC" },
+        { kind: "place", side: "buy", price: 101, qty: 4, tif: "IOC" },
+      ],
+    },
+  });
+  const basketReceiptMsg = (await nextMessage(client)) as Extract<
+    ServerMessage,
+    { type: "receipt" }
+  >;
+  assert.equal(basketReceiptMsg.type, "receipt");
+  const bRcpt = basketReceiptMsg.receipt as Extract<
+    ServerMessage,
+    { type: "receipt" }
+  >["receipt"] & { kind: "basket" };
+  assert.equal(bRcpt.status, "committed");
+  assert.equal(bRcpt.legs.length, 2);
+
+  // Same-key retry over the wire replays the identical receipt.
+  send(client, {
+    type: "submit",
+    key: "bk-1",
+    request: {
+      kind: "basket",
+      legs: [
+        { kind: "place", side: "buy", price: 100, qty: 2, tif: "IOC" },
+        { kind: "place", side: "buy", price: 101, qty: 4, tif: "IOC" },
+      ],
+    },
+  });
+  const dupMsg = await nextMessage(client);
+  assert.deepEqual(dupMsg, basketReceiptMsg);
+
+  // Rejected basket: 2@101 remains, so leg 1 fills but leg 2 cannot.
+  send(client, {
+    type: "submit",
+    key: "bk-2",
+    request: {
+      kind: "basket",
+      legs: [
+        { kind: "place", side: "buy", price: 101, qty: 2, tif: "IOC" },
+        { kind: "place", side: "buy", price: 101, qty: 50, tif: "IOC" },
+      ],
+    },
+  });
+  const rejMsg = (await nextMessage(client)) as Extract<
+    ServerMessage,
+    { type: "receipt" }
+  >;
+  assert.equal(rejMsg.type, "receipt");
+  const rejRcpt = rejMsg.receipt as { status: string; failedLeg?: number };
+  assert.equal(rejRcpt.status, "rejected");
+  assert.equal(rejRcpt.failedLeg, 1);
+
+  // Drain the subscriber stream: only the two GTC accepts + the committed
+  // basket's events may appear; the rejected basket contributes nothing.
+  type WireEvt = Extract<ServerMessage, { type: "event" }>;
+  type TradeFrame = WireEvt & {
+    event: Extract<WireEvt["event"], { type: "trade" }>;
+  };
+  const isTradeFrame = (m: ServerMessage): m is TradeFrame =>
+    m.type === "event" && m.event.type === "trade";
+  const frames = await subQ.drainFor(2000);
+  const events = frames.filter(
+    (m): m is Extract<ServerMessage, { type: "event" }> => m.type === "event",
+  );
+  const trades = frames.filter(isTradeFrame);
+  const commitSeqs = new Set(events.map((e) => e.commitSeq));
+  assert.ok(
+    ![...commitSeqs].some((c) => c === 4),
+    "rejected basket (recvSeq 4) published nothing",
+  );
+
+  // Unique trade ids; receipt fills correspond 1:1 to pushed trade frames.
+  const pushedTradeIds = trades.map((t) => t.event.tradeId);
+  assert.equal(new Set(pushedTradeIds).size, pushedTradeIds.length);
+  const receiptTradeIds = bRcpt.legs.flatMap((l) =>
+    l.fills.map((f) => f.tradeId),
+  );
+  assert.deepEqual([...receiptTradeIds].sort(), [...pushedTradeIds].sort());
+
+  // Every basket event shares the basket's single commitSeq.
+  const basketCommit = events.find((e) =>
+    trades.some((t) => t.seq === e.seq),
+  )!.commitSeq;
+  for (const t of trades) assert.equal(t.commitSeq, basketCommit);
+
+  const lastSeq = events[events.length - 1]!.seq;
+  sub.terminate();
+  client.terminate();
+  await server.close();
+
+  // ---- Restart: the committed basket facts survive; resubscribe replays them.
+  server = await startWsServer({
+    dbPath: join(dir, "b.db"),
+    publisherBufferSize: 2,
+    snapshotEveryEvents: 3,
+  });
+  const resub = await connect(server.port);
+  const resubQ = messageQueue(resub);
+  send(resub, { type: "subscribe", lastSeq: 0 });
+  const restartFrames = await resubQ.drainFor(2500);
+  assert.ok(restartFrames.some((m) => m.type === "caught_up"));
+  const resentTrades = restartFrames.filter(isTradeFrame);
+  assert.deepEqual(
+    resentTrades.map((t) => t.event.tradeId).sort(),
+    [...pushedTradeIds].sort(),
+    "restarted service replays the same basket trade facts",
+  );
+
+  // The sequence continues after the restart with no gap or reuse: the
+  // rejected basket consumed recvSeq 4, so the next commit is 5.
+  const client2 = await connect(server.port);
+  send(client2, {
+    type: "submit",
+    request: { kind: "place", side: "buy", price: 101, qty: 1, tif: "IOC" },
+  });
+  const afterRestart = (await nextMessage(client2)) as Extract<
+    ServerMessage,
+    { type: "receipt" }
+  >;
+  assert.equal(afterRestart.type, "receipt");
+  assert.equal(server.service.lastCommitSeq(), 5);
+  assert.ok(lastSeq > 0);
+  resub.terminate();
+  client2.terminate();
+});
